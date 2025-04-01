@@ -6,12 +6,12 @@ mod value {
     use super::*;
 
     pub fn serialize<S: Serialize>(x: &S) -> Value {
-        let buf = crate::serialize(x);
+        let buf = crate::serialize(x).unwrap();
         crate::deserialize(&buf).unwrap()
     }
 
     pub fn deserialize<D: Deserialize>(value: Value) -> Result<D, DeserializeError> {
-        let buf = crate::serialize(value);
+        let buf = crate::serialize(value).unwrap();
         crate::deserialize::<D>(&buf)
     }
 }
@@ -439,7 +439,7 @@ fn arb_value() -> impl Strategy<Value = Value> {
 proptest! {
     #[test]
     fn roundtrip_binary(v in arb_value()) {
-        let buf = msgpack_schema::serialize(&v);
+        let buf = msgpack_schema::serialize(&v).unwrap();
         assert_eq!(v, msgpack_schema::deserialize(buf.as_slice()).unwrap());
     }
 }
@@ -558,6 +558,7 @@ fn deserialize_tuple_struct() {
 
 #[test]
 fn deserialize_tuple_struct_wrong_length() {
+    #[allow(dead_code)]
     #[derive(Deserialize, Debug)]
     struct S(u32, bool);
 
@@ -625,4 +626,143 @@ fn regression_test_variable_capture() {
             r#type: 456,
         }
     ));
+}
+
+#[test]
+fn serialize_with_skipped_fields() {
+    #[derive(Serialize, Debug, PartialEq, Eq)]
+    struct Human {
+        #[tag = 0]
+        age: u32,
+        #[skip]
+        name: String,
+    }
+
+    let val = Human {
+        age: 42,
+        name: "John".to_string(),
+    };
+
+    assert_eq!(
+        value::serialize(&val),
+        Value::Map(vec![(Value::Int(0.into()), Value::Int(42.into())),])
+    );
+}
+
+#[allow(unused_variables)]
+#[test]
+fn deserialize_with_skipped_fields() {
+    #[derive(Deserialize, PartialEq, Eq, Debug)]
+    struct Human {
+        #[tag = 0]
+        age: u32,
+        #[skip]
+        name: String,
+    }
+
+    let val = Value::Map(vec![
+        (Value::Int(0.into()), Value::Int(42.into())),
+        (Value::Int(2.into()), Value::Str("John".to_owned().into())),
+    ]);
+
+    assert_eq!(
+        Human {
+            age: 42,
+            name: "".into(),
+        },
+        value::deserialize(val).unwrap()
+    );
+}
+
+#[test]
+fn deserialize_with_default_fields() {
+    #[derive(Deserialize, PartialEq, Eq, Debug)]
+    struct Human {
+        #[tag = 0]
+        age: u32,
+        #[tag = 1]
+        #[default = "abc"]
+        name: String,
+        #[tag = 2]
+        #[default = "default_true"]
+        passed: bool,
+    }
+
+    fn default_true() -> bool {
+        true
+    }
+    fn abc() -> String {
+        "abc".to_string()
+    }
+
+    let val = Value::Map(vec![(Value::Int(0.into()), Value::Int(42.into()))]);
+
+    assert_eq!(
+        Human {
+            age: 42,
+            name: "abc".into(),
+            passed: true,
+        },
+        value::deserialize(val).unwrap()
+    );
+}
+
+#[test]
+fn serialize_enum_with_named_fields() {
+    #[derive(Serialize, Debug, PartialEq, Eq)]
+    enum Data {
+        #[tag = 0]
+        UserInfo {
+            #[tag = 0]
+            age: u32,
+            #[tag = 1]
+            name: String,
+        },
+    }
+
+    let val = Data::UserInfo {
+        age: 42,
+        name: "John".to_string(),
+    };
+
+    assert_eq!(
+        value::serialize(&val),
+        Value::Array(vec![
+            Value::Int(0.into()),
+            Value::Map(vec![
+                (Value::Int(0.into()), Value::Int(42.into())),
+                (Value::Int(1.into()), Value::Str("John".to_owned().into()))
+            ])
+        ])
+    );
+}
+
+#[test]
+fn deserialize_enum_with_named_fields() {
+    #[derive(Deserialize, Debug, PartialEq, Eq)]
+    enum Data {
+        #[tag = 0]
+        UserInfo {
+            #[tag = 0]
+            age: u32,
+            #[tag = 1]
+            name: String,
+        },
+    }
+
+    let val = Value::Array(vec![
+        Value::Int(0.into()),
+        Value::Map(vec![
+            (Value::Int(0.into()), Value::Int(42.into())),
+            (Value::Int(1.into()), Value::Str("John".to_owned().into())),
+        ]),
+    ]);
+
+    assert_eq!(
+        Data::UserInfo {
+            age: 42,
+            name: "John".to_string(),
+        },
+        value::deserialize(val).unwrap()
+    );
 }

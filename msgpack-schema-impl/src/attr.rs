@@ -1,7 +1,7 @@
 use quote::ToTokens;
 use syn::{
     parse::{ParseStream, Parser},
-    Attribute, Error, LitInt, Result, Token,
+    Attribute, Error, LitInt, LitStr, Result, Token,
 };
 
 pub struct Attrs<'a> {
@@ -9,8 +9,20 @@ pub struct Attrs<'a> {
     pub optional: Option<Optional<'a>>,
     pub untagged: Option<Untagged<'a>>,
     pub flatten: Option<Flatten<'a>>,
+    pub skip: Option<Skip<'a>>,
+    pub default: Option<Default<'a>>,
 }
-
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct Skip<'a> {
+    pub original: &'a Attribute,
+}
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct Default<'a> {
+    pub original: &'a Attribute,
+    pub path: String,
+}
 #[derive(Clone)]
 pub struct Tag<'a> {
     pub original: &'a Attribute,
@@ -38,6 +50,8 @@ pub fn get(attrs: &[Attribute]) -> Result<Attrs> {
         optional: None,
         untagged: None,
         flatten: None,
+        skip: None,
+        default: None,
     };
 
     for attr in attrs {
@@ -76,6 +90,26 @@ pub fn get(attrs: &[Attribute]) -> Result<Attrs> {
                 return Err(Error::new_spanned(attr, "duplicate #[flatten] attribute"));
             }
             output.flatten = Some(Flatten { original: attr });
+        } else if attr.path().is_ident("skip") {
+            attr.meta.require_path_only()?;
+            if output.skip.is_some() {
+                return Err(Error::new_spanned(attr, "duplicate #[skip] attribute"));
+            }
+            output.skip = Some(Skip { original: attr });
+        } else if attr.path().is_ident("default") {
+            let name_value = attr.meta.require_name_value()?;
+            let parser = |input: ParseStream| {
+                let lit_str = input.parse::<LitStr>()?;
+                Ok(lit_str.value())
+            };
+            let path = parser.parse2(name_value.value.to_token_stream())?;
+            if output.default.is_some() {
+                return Err(Error::new_spanned(attr, "duplicate #[default] attribute"));
+            }
+            output.default = Some(Default {
+                original: attr,
+                path,
+            });
         }
     }
     Ok(output)
@@ -86,6 +120,8 @@ fn parse_schema_attribute<'a>(output: &mut Attrs<'a>, attr: &'a Attribute) -> Re
     syn::custom_keyword!(tag);
     syn::custom_keyword!(untagged);
     syn::custom_keyword!(flatten);
+    syn::custom_keyword!(skip);
+    syn::custom_keyword!(default);
 
     attr.parse_args_with(|input: ParseStream| {
         if let Some(_kw) = input.parse::<Option<optional>>()? {
@@ -106,6 +142,12 @@ fn parse_schema_attribute<'a>(output: &mut Attrs<'a>, attr: &'a Attribute) -> Re
             }
             output.flatten = Some(Flatten { original: attr });
             return Ok(());
+        } else if let Some(_kw) = input.parse::<Option<skip>>()? {
+            if output.skip.is_some() {
+                return Err(Error::new_spanned(attr, "duplicate #[skip] attribute"));
+            }
+            output.skip = Some(Skip { original: attr });
+            return Ok(());
         } else if let Some(_kw) = input.parse::<Option<tag>>()? {
             let _eq_token: Token![=] = input.parse()?;
             let lit_int = input.parse::<LitInt>()?;
@@ -116,6 +158,18 @@ fn parse_schema_attribute<'a>(output: &mut Attrs<'a>, attr: &'a Attribute) -> Re
             output.tag = Some(Tag {
                 original: attr,
                 tag,
+            });
+            return Ok(());
+        } else if let Some(_kw) = input.parse::<Option<default>>()? {
+            let _eq_token: Token![=] = input.parse()?;
+            let lit_str = input.parse::<LitStr>()?;
+            let path = lit_str.value();
+            if output.default.is_some() {
+                return Err(Error::new_spanned(attr, "duplicate #[default] attribute"));
+            }
+            output.default = Some(Default {
+                original: attr,
+                path,
             });
             return Ok(());
         }
@@ -132,7 +186,7 @@ fn parse_schema_attribute<'a>(output: &mut Attrs<'a>, attr: &'a Attribute) -> Re
     })
 }
 
-impl<'a> Attrs<'a> {
+impl Attrs<'_> {
     pub fn disallow_tag(&self) -> Result<()> {
         if let Some(tag) = self.tag.clone() {
             return Err(Error::new_spanned(

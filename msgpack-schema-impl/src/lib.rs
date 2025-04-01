@@ -6,7 +6,7 @@ use proc_macro::TokenStream;
 use syn::{parse_macro_input, DeriveInput};
 
 /// The `schema` attribute is experimental.
-#[proc_macro_derive(Serialize, attributes(schema, tag, optional, untagged, flatten))]
+#[proc_macro_derive(Serialize, attributes(schema, tag, optional, untagged, flatten, skip))]
 pub fn derive_serialize(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     serialize::derive(&input)
@@ -15,7 +15,10 @@ pub fn derive_serialize(input: TokenStream) -> TokenStream {
 }
 
 /// The `schema` attribute is experimental.
-#[proc_macro_derive(Deserialize, attributes(schema, tag, optional, untagged, flatten))]
+#[proc_macro_derive(
+    Deserialize,
+    attributes(schema, tag, optional, untagged, flatten, skip, default)
+)]
 pub fn derive_deserialize(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     deserialize::derive(&input)

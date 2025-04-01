@@ -1,3 +1,4 @@
+#![allow(non_local_definitions)]
 //! The MessagePack Data Model
 //!
 //! See also the [specification](https://github.com/msgpack/msgpack/blob/master/spec.md).
@@ -237,7 +238,7 @@ impl Arbitrary for Int {
                 if high < 0 {
                     Int::from(high)
                 } else {
-                    Int::from((high as u64) << 1 | (low as u64))
+                    Int::from(((high as u64) << 1) | (low as u64))
                 }
             })
             .boxed()
@@ -264,8 +265,8 @@ impl Arbitrary for Int {
 /// it is recommended to use _string type_ instead of binary type for its encoding scheme for the following reasons.
 ///
 /// - It just saves some memory. If your byte array is less than 32 byte length, using string type instead of byte array saves one byte per object.
-/// - The disiction only matters when _not_ using a data schema. Because this crate offers a statically-typed data schema, and we know how to decode data into a Rust object at compile time,
-/// distinction of these types in the input binary data is almost useless,
+/// - The distinction only matters when _not_ using a data schema. Because this crate offers a statically-typed data schema, and we know how to decode data into a Rust object at compile time,
+///     distinction of these types in the input binary data is almost useless,
 ///
 /// Although we strongly recommend you to use string types rather than binary types, this crate does _not_ force you to do so.
 /// The functions and trait implementations provided by this crate are all taking a neutral stand.

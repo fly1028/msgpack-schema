@@ -7,7 +7,12 @@ use syn::{
     Data, DataEnum, DataStruct, DeriveInput, Error, Field, Fields, FieldsNamed, FieldsUnnamed,
     Result,
 };
-
+enum FieldKind {
+    Ordinary(u32),
+    Optional(u32),
+    Flatten,
+    Skip,
+}
 pub fn derive(node: &DeriveInput) -> Result<TokenStream> {
     let attrs = attr::get(&node.attrs)?;
     attrs.disallow_optional()?;
@@ -64,109 +69,25 @@ fn derive_struct(
     let ty = &node.ident;
     let (impl_generics, ty_generics, where_clause) = node.generics.split_for_impl();
 
-    enum FieldKind {
-        Ordinary(u32),
-        Optional(u32),
-        Flatten,
-    }
+    let fields = process_fields(named_fields)?;
 
-    let fields = {
-        let mut fields = vec![];
-        let mut tags = vec![];
-        for field in &named_fields.named {
-            let ident = field.ident.clone().unwrap();
-            let ty = field.ty.clone();
-            let attrs = attr::get(&field.attrs)?;
-            attrs.disallow_untagged()?;
-            let kind = if attrs.flatten.is_some() {
-                attrs.disallow_tag()?;
-                attrs.disallow_optional()?;
-                FieldKind::Flatten
-            } else {
-                attrs.require_tag(field)?;
-                attr::check_tag_uniqueness(attrs.tag.as_ref().unwrap(), &mut tags)?;
-                let tag = attrs.tag.unwrap().tag;
-                // TODO: require `#[required]` or `#[optional]` for fields of the Option<T> type
-                if attrs.optional.is_some() {
-                    FieldKind::Optional(tag)
-                } else {
-                    FieldKind::Ordinary(tag)
-                }
-            };
-            fields.push((ident, ty, kind));
-        }
-        fields
-    };
+    let count_fields_body = generate_field_count(
+        &fields,
+        named_fields.named.len() as u32,
+        |ident| quote! { self.#ident },
+    );
 
-    let count_fields_body = {
-        let max_len = named_fields.named.len() as u32;
-
-        let mut decs = vec![];
-        for (ident, ty, kind) in &fields {
-            match kind {
-                FieldKind::Flatten => {
-                    decs.push(quote! {
-                        max_len -= 1;
-                        max_len += <#ty as ::msgpack_schema::StructSerialize>::count_fields(&self.#ident);
-                    });
-                }
-                FieldKind::Optional(_) => {
-                    decs.push(quote! {
-                        if self.#ident.is_none() {
-                            max_len -= 1;
-                        }
-                    });
-                }
-                FieldKind::Ordinary(_) => {}
-            }
-        }
-
-        quote! {
-            let mut max_len: u32 = #max_len;
-            #( #decs )*
-            max_len
-        }
-    };
-
-    let serialize_fields_body = {
-        let mut pushes = vec![];
-        for (ident, ty, kind) in &fields {
-            let code = match kind {
-                FieldKind::Ordinary(tag) => {
-                    quote! {
-                        serializer.serialize(#tag);
-                        serializer.serialize(&self.#ident);
-                    }
-                }
-                FieldKind::Optional(tag) => {
-                    quote! {
-                        if let Some(value) = &self.#ident {
-                            serializer.serialize(#tag);
-                            serializer.serialize(value);
-                        }
-                    }
-                }
-                FieldKind::Flatten => {
-                    quote! {
-                        <#ty as ::msgpack_schema::StructSerialize>::serialize_fields(&self.#ident, serializer);
-                    }
-                }
-            };
-            pushes.push(code);
-        }
-
-        quote! {
-            #( #pushes )*
-        }
-    };
+    let serialize_fields_body =
+        generate_field_serialization(&fields, |ident| quote! { self.#ident });
 
     let gen = quote! {
         #[allow(unused_qualifications)]
         impl #impl_generics ::msgpack_schema::Serialize for #ty #ty_generics #where_clause {
-            fn serialize(&self, serializer: &mut ::msgpack_schema::Serializer) {
+            fn serialize(&self, serializer: &mut ::msgpack_schema::Serializer) -> Result<(), ::msgpack_schema::SerializeError>{
                 let count = <Self as ::msgpack_schema::StructSerialize>::count_fields(self);
-                serializer.serialize_map(count);
-                <Self as ::msgpack_schema::StructSerialize>::serialize_fields(self, serializer);
+                serializer.serialize_map(count)?;
+                <Self as ::msgpack_schema::StructSerialize>::serialize_fields(self, serializer)?;
+                Ok(())
             }
         }
 
@@ -176,8 +97,9 @@ fn derive_struct(
                 #count_fields_body
             }
 
-            fn serialize_fields(&self, serializer: &mut ::msgpack_schema::Serializer) {
+            fn serialize_fields(&self, serializer: &mut ::msgpack_schema::Serializer) -> Result<(), ::msgpack_schema::SerializeError>{
                 #serialize_fields_body
+                Ok(())
             }
         }
     };
@@ -200,14 +122,15 @@ fn derive_newtype_struct(
     attrs.disallow_flatten()?;
 
     let fn_body = quote! {
-        serializer.serialize(&self.0);
+        serializer.serialize(&self.0)?;
     };
 
     let gen = quote! {
         #[allow(unused_qualifications)]
         impl #impl_generics ::msgpack_schema::Serialize for #ty #ty_generics #where_clause {
-            fn serialize(&self, serializer: &mut ::msgpack_schema::Serializer) {
+            fn serialize(&self, serializer: &mut ::msgpack_schema::Serializer) -> Result<(), ::msgpack_schema::SerializeError>{
                 #fn_body
+                Ok(())
             }
         }
     };
@@ -235,15 +158,16 @@ fn derive_tuple_struct(
     let field_specs = (0..count).map(|n| TokenStream::from_str(&format!("{}", n)).unwrap());
 
     let fn_body = quote! {
-        serializer.serialize_array(#count);
-        #( serializer.serialize(&self.#field_specs); )*
+        serializer.serialize_array(#count)?;
+        #( serializer.serialize(&self.#field_specs)?; )*
     };
 
     let gen = quote! {
         #[allow(unused_qualifications)]
         impl #impl_generics ::msgpack_schema::Serialize for #ty #ty_generics #where_clause {
-            fn serialize(&self, serializer: &mut ::msgpack_schema::Serializer) {
+            fn serialize(&self, serializer: &mut ::msgpack_schema::Serializer) -> Result<(), ::msgpack_schema::SerializeError>{
                 #fn_body
+                Ok(())
             }
         }
     };
@@ -268,11 +192,46 @@ fn derive_enum(node: &DeriveInput, enu: &DataEnum) -> Result<TokenStream> {
             attr::check_tag_uniqueness(attrs.tag.as_ref().unwrap(), &mut tags)?;
             let tag = attrs.tag.unwrap().tag;
             match &variant.fields {
-                Fields::Named(_) => {
-                    return Err(Error::new_spanned(
-                        node,
-                        "variants with fields are not supported",
-                    ));
+                Fields::Named(fields) => {
+                    // Create a struct-like implementation for a named fields variant
+                    // We'll serialize as an array of [tag, map]
+
+                    // Process fields using common helper
+                    let variant_fields = process_fields(fields)?;
+
+                    // Generate pattern matching for field extraction and field names for struct pattern
+                    let field_names = variant_fields
+                        .iter()
+                        .map(|(ident, _, _)| quote! { #ident })
+                        .collect::<Vec<_>>();
+
+                    // Generate field count calculation using common helper
+                    let field_count_code = generate_field_count(
+                        &variant_fields,
+                        fields.named.len() as u32,
+                        |ident| quote! { #ident },
+                    );
+
+                    // Generate field serialization using common helper
+                    let serialize_fields_code =
+                        generate_field_serialization(&variant_fields, |ident| quote! { #ident });
+
+                    // Add the clause for this named-fields variant
+                    clauses.push(quote! {
+                        Self::#ident { #(#field_names),* } => {
+                            serializer.serialize_array(2)?;
+                            serializer.serialize(#tag)?;
+
+                            // Serialize as a map, similar to struct serialization
+                            let count = {
+                                #field_count_code
+                            };
+                            serializer.serialize_map(count)?;
+
+                            // Serialize the fields
+                            #serialize_fields_code
+                        }
+                    });
                 }
                 Fields::Unnamed(fields) => {
                     let len = fields.unnamed.len() as u32;
@@ -280,7 +239,7 @@ fn derive_enum(node: &DeriveInput, enu: &DataEnum) -> Result<TokenStream> {
                         0 => {
                             clauses.push(quote! {
                                 Self::#ident() => {
-                                    serializer.serialize(#tag);
+                                    serializer.serialize(#tag)?;
                                 }
                             });
                         }
@@ -292,9 +251,9 @@ fn derive_enum(node: &DeriveInput, enu: &DataEnum) -> Result<TokenStream> {
                             attrs.disallow_flatten()?;
                             clauses.push(quote! {
                                 Self::#ident(value) => {
-                                    serializer.serialize_array(2);
-                                    serializer.serialize(#tag);
-                                    serializer.serialize(value);
+                                    serializer.serialize_array(2)?;
+                                    serializer.serialize(#tag)?;
+                                    serializer.serialize(value)?;
                                 }
                             });
                         }
@@ -309,7 +268,7 @@ fn derive_enum(node: &DeriveInput, enu: &DataEnum) -> Result<TokenStream> {
                 Fields::Unit => {
                     clauses.push(quote! {
                         Self::#ident => {
-                            serializer.serialize(#tag);
+                            serializer.serialize(#tag)?;
                         }
                     });
                 }
@@ -326,8 +285,9 @@ fn derive_enum(node: &DeriveInput, enu: &DataEnum) -> Result<TokenStream> {
     let gen = quote! {
         #[allow(unused_qualifications)]
         impl #impl_generics ::msgpack_schema::Serialize for #ty #ty_generics #where_clause {
-            fn serialize(&self, serializer: &mut ::msgpack_schema::Serializer) {
+            fn serialize(&self, serializer: &mut ::msgpack_schema::Serializer) -> Result<(), ::msgpack_schema::SerializeError>{
                 #fn_body
+                Ok(())
             }
         }
     };
@@ -390,7 +350,7 @@ fn derive_untagged_enum(node: &DeriveInput, enu: &DataEnum) -> Result<TokenStrea
             let ident = variant.ident.clone();
             clauses.push(quote! {
                 Self::#ident(value) => {
-                    serializer.serialize(value)
+                    serializer.serialize(value)?
                 }
             });
         }
@@ -405,8 +365,9 @@ fn derive_untagged_enum(node: &DeriveInput, enu: &DataEnum) -> Result<TokenStrea
     let gen = quote! {
         #[allow(unused_qualifications)]
         impl #impl_generics ::msgpack_schema::Serialize for #ty #ty_generics #where_clause {
-            fn serialize(&self, serializer: &mut ::msgpack_schema::Serializer) {
+            fn serialize(&self, serializer: &mut ::msgpack_schema::Serializer) -> Result<(), ::msgpack_schema::SerializeError>{
                 #fn_body
+                Ok(())
             }
         }
     };
@@ -439,13 +400,13 @@ fn derive_untagged_struct(
         let mut pushes = vec![];
         for ident in &members {
             let push = quote! {
-                serializer.serialize(&self.#ident);
+                serializer.serialize(&self.#ident)?;
             };
             pushes.push(push);
         }
 
         quote! {
-            serializer.serialize_array(#len);
+            serializer.serialize_array(#len)?;
             #( #pushes )*
         }
     };
@@ -453,11 +414,131 @@ fn derive_untagged_struct(
     let gen = quote! {
         #[allow(unused_qualifications)]
         impl #impl_generics ::msgpack_schema::Serialize for #ty #ty_generics #where_clause {
-            fn serialize(&self, serializer: &mut ::msgpack_schema::Serializer) {
+            fn serialize(&self, serializer: &mut ::msgpack_schema::Serializer) -> Result<(), ::msgpack_schema::SerializeError>{
                 #fn_body
+                Ok(())
             }
         }
     };
 
     Ok(gen)
+}
+
+/// Processes fields to extract field kind information
+fn process_fields(fields: &FieldsNamed) -> Result<Vec<(proc_macro2::Ident, syn::Type, FieldKind)>> {
+    let mut processed_fields = vec![];
+    let mut tags = vec![];
+
+    for field in &fields.named {
+        let ident = field.ident.clone().unwrap();
+        let ty = field.ty.clone();
+        let attrs = attr::get(&field.attrs)?;
+        attrs.disallow_untagged()?;
+
+        let kind = if attrs.skip.is_some() {
+            // Skip attribute takes precedence
+            attrs.disallow_tag()?;
+            attrs.disallow_optional()?;
+            attrs.disallow_flatten()?;
+            FieldKind::Skip
+        } else if attrs.flatten.is_some() {
+            attrs.disallow_tag()?;
+            attrs.disallow_optional()?;
+            FieldKind::Flatten
+        } else {
+            attrs.require_tag(field)?;
+            attr::check_tag_uniqueness(attrs.tag.as_ref().unwrap(), &mut tags)?;
+            let tag = attrs.tag.unwrap().tag;
+            if attrs.optional.is_some() {
+                FieldKind::Optional(tag)
+            } else {
+                FieldKind::Ordinary(tag)
+            }
+        };
+
+        processed_fields.push((ident, ty, kind));
+    }
+
+    Ok(processed_fields)
+}
+
+/// Generates field count calculation code
+fn generate_field_count(
+    fields: &Vec<(proc_macro2::Ident, syn::Type, FieldKind)>,
+    max_len: u32,
+    self_accessor: impl Fn(&proc_macro2::Ident) -> TokenStream,
+) -> TokenStream {
+    let mut decs = vec![];
+
+    for (ident, ty, kind) in fields {
+        let field_access = self_accessor(ident);
+        match kind {
+            FieldKind::Flatten => {
+                decs.push(quote! {
+                    max_len -= 1;
+                    max_len += <#ty as ::msgpack_schema::StructSerialize>::count_fields(&#field_access);
+                });
+            }
+            FieldKind::Optional(_) => {
+                decs.push(quote! {
+                    if #field_access.is_none() {
+                        max_len -= 1;
+                    }
+                });
+            }
+            FieldKind::Ordinary(_) => {}
+            FieldKind::Skip => {
+                decs.push(quote! {
+                    max_len -= 1; // Reduce count for skipped field
+                });
+            }
+        }
+    }
+
+    quote! {
+        let mut max_len: u32 = #max_len;
+        #( #decs )*
+        max_len
+    }
+}
+
+/// Generates field serialization code
+fn generate_field_serialization(
+    fields: &Vec<(proc_macro2::Ident, syn::Type, FieldKind)>,
+    self_accessor: impl Fn(&proc_macro2::Ident) -> TokenStream,
+) -> TokenStream {
+    let mut pushes = vec![];
+
+    for (ident, ty, kind) in fields {
+        let field_access = self_accessor(ident);
+        let code = match kind {
+            FieldKind::Ordinary(tag) => {
+                quote! {
+                    serializer.serialize(#tag)?;
+                    serializer.serialize(&#field_access)?;
+                }
+            }
+            FieldKind::Optional(tag) => {
+                quote! {
+                    if let Some(value) = &#field_access {
+                        serializer.serialize(#tag)?;
+                        serializer.serialize(value)?;
+                    }
+                }
+            }
+            FieldKind::Flatten => {
+                quote! {
+                    <#ty as ::msgpack_schema::StructSerialize>::serialize_fields(&#field_access, serializer)?;
+                }
+            }
+            FieldKind::Skip => {
+                quote! {} // Skip this field, nothing to push
+            }
+        };
+        pushes.push(code);
+    }
+
+    quote! {
+        #( #pushes )*
+    }
 }
